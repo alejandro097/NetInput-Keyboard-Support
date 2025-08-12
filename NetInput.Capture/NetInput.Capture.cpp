@@ -1,124 +1,130 @@
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0600
+
 #include <Windows.h>
 #include <XInput.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <objbase.h>
-
 #include <iostream>
-#include <vector>
+#include <fstream>
 #include <thread>
 #include <chrono>
-#include <string>
-#include <stdint.h>
-#include <fstream>
 
-SOCKET sock;
-struct sockaddr_in addr;
-XINPUT_STATE lastSentInputStates[XUSER_MAX_COUNT];
+#pragma comment(lib, "ws2_32.lib")
 
-void SendResetControllers()
-{
-	uint8_t packet[] = { 0xFFu };
-	if (sendto(sock, (const char*)&packet, sizeof(packet), 0, (struct sockaddr*)&addr, sizeof(addr)) != sizeof(packet))
-		printf("Failed to send reset message.\n");
+SOCKET sock = INVALID_SOCKET;
+sockaddr_in addr;
+
+XINPUT_STATE lastSentInputState;
+
+HHOOK keyboardHook;
+
+void SendResetControllers() {
+    uint8_t packet[] = { 0xFFu };
+    sendto(sock, (const char*)packet, sizeof(packet), 0, (sockaddr*)&addr, sizeof(addr));
 }
 
-void PollControllers() 
-{
-	XINPUT_STATE state;
-	for (uint32_t i = 0u; i < XUSER_MAX_COUNT; i++)
-	{
-		memset(&state, 0, sizeof(XINPUT_STATE));
-		if (XInputGetState(i, &state) != ERROR_SUCCESS)
-			continue;
+void PollController() {
+    XINPUT_STATE state = {};
+    if (XInputGetState(0, &state) != ERROR_SUCCESS)
+        return;
 
-		if (memcmp(lastSentInputStates + i, &state, sizeof(XINPUT_STATE)) == 0)
-			continue;
+    if (memcmp(&lastSentInputState, &state, sizeof(XINPUT_STATE)) == 0)
+        return;
 
-		uint8_t packet[sizeof(XINPUT_STATE) + 1];
-		packet[0] = (uint8_t)i;
-		memcpy(packet + 1, &state, sizeof(XINPUT_STATE));
-		memcpy(lastSentInputStates + i, &state, sizeof(XINPUT_STATE));
+    uint8_t packet[sizeof(XINPUT_STATE) + 1];
+    packet[0] = 0;
+    memcpy(packet + 1, &state, sizeof(XINPUT_STATE));
+    memcpy(&lastSentInputState, &state, sizeof(XINPUT_STATE));
 
-		if (sendto(sock, (const char*)&packet, sizeof(packet), 0, (struct sockaddr*)&addr, sizeof(addr)) != sizeof(packet))
-			printf("Failed to send update message of controller %u.\n", i);
-	}
+    sendto(sock, (const char*)packet, sizeof(packet), 0, (sockaddr*)&addr, sizeof(addr));
 }
 
-int main()
-{
-	std::string ip;
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT* pkb = (KBDLLHOOKSTRUCT*)lParam;
+        BYTE data[2] = { (BYTE)pkb->vkCode, (BYTE)((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) ? 1 : 0) };
+        sendto(sock, (const char*)data, 2, 0, (sockaddr*)&addr, sizeof(addr));
 
-	std::ifstream input_file("target.txt");
-	if (input_file.is_open())
-	{
-		printf("Reading ip from target.txt.\n");
-		ip = std::string((std::istreambuf_iterator<char>(input_file)), std::istreambuf_iterator<char>());
+        if (pkb->vkCode == VK_SPACE)
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
 
-		if (inet_pton(AF_INET, ip.c_str(), &(addr.sin_addr)) != 1)
-		{
-			std::cout << ip << " is not a valid ip, please correct target.txt\n";
-			return -1;
-		}
-	}
+        return 1; // Block key locally
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
 
-	if (ip.empty())
-	{
-		while (true)
-		{
-			printf("Please enter the IP of the target computer.\n");
+int main() {
+    std::string ip;
+    std::ifstream input_file("target.txt");
+    if (input_file.is_open()) {
+        std::cout << "Reading IP from target.txt...\n";
+        ip = std::string((std::istreambuf_iterator<char>(input_file)), std::istreambuf_iterator<char>());
+        if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+            std::cout << ip << " is not a valid IP. Please correct target.txt.\n";
+            return -1;
+        }
+    }
 
-			std::cin >> ip;			
-			if (inet_pton(AF_INET, ip.c_str(), &(addr.sin_addr)) == 1)
-				break;
+    if (ip.empty()) {
+        while (true) {
+            std::cout << "Enter target IP: ";
+            std::cin >> ip;
+            if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) == 1)
+                break;
+            std::cout << ip << " is not a valid IP.\n";
+        }
+    }
 
-			std::cout << ip << " is not a valid ip.\n";
-		}
-	}
+    std::cout << "Target IP: " << ip << "\n";
 
-	printf("Target is %s.\n", ip.c_str());
+    CoInitialize(NULL);
 
-	CoInitialize(NULL);
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cout << "WSAStartup failed.\n";
+        return -2;
+    }
 
-	printf("Starting networking...\n");
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        std::cout << "Failed to create socket.\n";
+        WSACleanup();
+        return -3;
+    }
 
-	WSADATA wsaData;
-	int wsaStartupResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (wsaStartupResult != 0) 
-	{
-		printf("WSAStartup failed with error code 0x%08X.\n", wsaStartupResult);
-		return -2;
-	}
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(60400); // Unified port
 
-	sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sock == INVALID_SOCKET)
-	{
-		printf("Failed to create UDP transmission socket.\n");
-		return -3;
-	}
+    SendResetControllers();
 
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(4313);
+    keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
+    if (!keyboardHook) {
+        std::cout << "Failed to install keyboard hook.\n";
+        closesocket(sock);
+        WSACleanup();
+        return -4;
+    }
 
-	printf("Sending reset...\n");
-	SendResetControllers();
-	printf("Done.\n");
+    memset(&lastSentInputState, 0, sizeof(XINPUT_STATE));
 
-	printf("Waiting for gamepad input, press ESC to exit...\n");
-	memset(lastSentInputStates, 0, sizeof(lastSentInputStates));
-	while (true)
-	{
-		if (GetKeyState(VK_ESCAPE) & 0x8000)
-			break;
+    MSG msg;
+    while (true) {
+        PollController();
 
-		PollControllers();
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	}
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
 
-	SendResetControllers();
-	closesocket(sock);
-	WSACleanup();
-	CoUninitialize();
-	return 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    SendResetControllers();
+    UnhookWindowsHookEx(keyboardHook);
+    closesocket(sock);
+    WSACleanup();
+    CoUninitialize();
+    return 0;
 }
