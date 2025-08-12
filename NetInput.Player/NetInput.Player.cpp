@@ -1,142 +1,125 @@
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0600
+
 #include <windows.h>
-#include <Xinput.h>
-#include <ViGEm/Client.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <objbase.h>
-
-#include <iostream>
+#include <Xinput.h>
+#include <ViGEm/Client.h>
 #include <stdint.h>
+#include <stdio.h>
 
-SOCKET sock;
-PVIGEM_TARGET pads[XUSER_MAX_COUNT];
-PVIGEM_CLIENT client;
+#pragma comment(lib, "ws2_32.lib")
 
-void ResetGamepads()
-{
-	for (int i = 0; i < XUSER_MAX_COUNT; i++)
-	{
-		auto pad = pads[i];
-		pads[i] = nullptr;
+#define LISTEN_PORT 60400
 
-		if (pad == nullptr)
-			continue;
+SOCKET sock = INVALID_SOCKET;
+PVIGEM_CLIENT client = nullptr;
+PVIGEM_TARGET pad = nullptr;
 
-		vigem_target_remove(client, pad);
-		vigem_target_free(pad);
-	}
+void ResetGamepad() {
+    if (pad) {
+        vigem_target_remove(client, pad);
+        vigem_target_free(pad);
+        pad = nullptr;
+        printf("Gamepad reset.\n");
+    }
 }
 
-int main()
-{
-	CoInitialize(NULL);
+void SendKey(WORD vkCode, BOOL keyDown) {
+    INPUT input = {0};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = 0;
+    input.ki.wScan = MapVirtualKey(vkCode, MAPVK_VK_TO_VSC);
+    input.ki.dwFlags = KEYEVENTF_SCANCODE | (keyDown ? 0 : KEYEVENTF_KEYUP);
+    if (vkCode == VK_LWIN || vkCode == VK_RWIN)
+        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    SendInput(1, &input, sizeof(INPUT));
+}
 
-	printf("Starting networking...\n");
+int main() {
+    CoInitialize(NULL);
+    printf("Starting receiver on UDP port %d...\n", LISTEN_PORT);
 
-	WSADATA wsaData;
-	int wsaStartupResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (wsaStartupResult != 0)
-	{
-		printf("WSAStartup failed with error code 0x%08X.\n", wsaStartupResult);
-		return -1;
-	}
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        printf("WSAStartup failed\n");
+        return 1;
+    }
 
-	sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sock == INVALID_SOCKET)
-	{
-		printf("Failed to create UDP transmission socket.\n");
-		return -2;
-	}
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        printf("Failed to create socket\n");
+        WSACleanup();
+        return 1;
+    }
 
-	struct sockaddr_in addr;
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(4313);
-	inet_pton(AF_INET, "0.0.0.0", &(addr.sin_addr));
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(LISTEN_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-	if (bind(sock, (const sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
-	{
-		printf("Failed to bind to 0.0.0.0:4313.");
-		closesocket(sock);
-		WSACleanup();
-		return -3;
-	}
+    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        printf("Bind failed\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
 
-	printf("Done.\n");
+    client = vigem_alloc();
+    if (!client || !VIGEM_SUCCESS(vigem_connect(client))) {
+        printf("ViGEm initialization failed\n");
+        vigem_free(client);
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
 
-	printf("Setting up ViGEmClient...\n");
-	client = vigem_alloc();
-	if (client == nullptr)
-	{
-		printf("Failed to setup ViGEmClient.\n");
-		closesocket(sock);
-		WSACleanup();
-		return -4;
-	}
+    printf("Receiver ready.\n");
 
-	printf("Connecting to ViGEm driver...\n");
-	const auto connectResult = vigem_connect(client);
-	if (!VIGEM_SUCCESS(connectResult))
-	{
-		printf("ViGEm Bus connection failed with error code 0x%08X.\n", connectResult);
-		vigem_free(client);
-		closesocket(sock);
-		WSACleanup();
-		return -5;
-	}
+    sockaddr_in sender = {};
+    int senderLen = sizeof(sender);
+    uint8_t buffer[sizeof(XINPUT_STATE) + 1];
 
-	printf("Done.\n");
+    while (true) {
+        int bytes = recvfrom(sock, (char*)buffer, sizeof(buffer), 0, (sockaddr*)&sender, &senderLen);
+        if (bytes <= 0) {
+            continue;
+        }
 
-	printf("Waiting for data...\n");
+        if (bytes == 2) {
+            WORD vkCode = buffer[0];
+            BOOL keyDown = (buffer[1] == 0);
+            SendKey(vkCode, keyDown);
+        }
+        else if (bytes == 1 && buffer[0] == 0xFFu) {
+            ResetGamepad();
+        }
+        else if (bytes == sizeof(XINPUT_STATE) + 1 && buffer[0] == 0) {
+            XINPUT_STATE* state = (XINPUT_STATE*)(buffer + 1);
 
-	struct sockaddr_in clientAddr;
-	uint8_t packet[sizeof(XINPUT_STATE) + 1];
-	while (true)
-	{
-		if (GetKeyState(VK_ESCAPE) & 0x8000)
-			break;
+            if (!pad) {
+                pad = vigem_target_x360_alloc();
+                if (!VIGEM_SUCCESS(vigem_target_add(client, pad))) {
+                    printf("Failed to add virtual gamepad.\n");
+                    vigem_target_free(pad);
+                    pad = nullptr;
+                    continue;
+                }
+                printf("Virtual gamepad connected.\n");
+            }
+            vigem_target_x360_update(client, pad, *(XUSB_REPORT*)&state->Gamepad);
+        }
+        else {
+            printf("Received unknown packet of size %d\n", bytes);
+        }
+    }
 
-		memset(&clientAddr, 0, sizeof(clientAddr));
-		int addrLen = sizeof(clientAddr);
-		int bytesReceived = recvfrom(sock, (char*)&packet, sizeof(packet), 0, (struct sockaddr*)&clientAddr, &addrLen);
-
-		if (bytesReceived == 1 && packet[0] == (uint8_t)0xFFu)
-		{
-			printf("Reset signal received, gamepads will be reset.\n");
-			ResetGamepads();
-		}
-		else if (bytesReceived == sizeof(packet) && packet[0] >= 0 && packet[0] < XUSER_MAX_COUNT)
-		{
-			uint32_t i = (uint32_t)packet[0];
-			XINPUT_STATE* state = (XINPUT_STATE*)(packet + 1);
-
-			if (pads[i] == nullptr)
-			{
-				auto pad = vigem_target_x360_alloc();
-				const auto targetAddResult = vigem_target_add(client, pad);
-				if (VIGEM_SUCCESS(targetAddResult))
-				{
-					printf("Connected new gamepad %u.\n", i);
-					pads[i] = pad;
-				}
-				else
-				{
-					vigem_target_free(pad);
-					printf("Failed to add pad %u with error code 0x%08X.\n", i, targetAddResult);
-				}
-			}
-
-			auto pad = pads[i];
-			if (pad != nullptr)
-				vigem_target_x360_update(client, pad, *reinterpret_cast<XUSB_REPORT*>(&state->Gamepad));
-		}
-	}
-
-	ResetGamepads();
-	vigem_disconnect(client);
-	vigem_free(client);
-	closesocket(sock);
-	WSACleanup();
-	CoUninitialize();
-	return 0;
+    ResetGamepad();
+    vigem_disconnect(client);
+    vigem_free(client);
+    closesocket(sock);
+    WSACleanup();
+    CoUninitialize();
+    return 0;
 }
