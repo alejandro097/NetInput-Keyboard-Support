@@ -1,17 +1,17 @@
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0600
 
+#include <objbase.h>
 #include <windows.h>
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <Xinput.h>
 #include <ViGEm/Client.h>
 #include <stdint.h>
 #include <stdio.h>
 
-#pragma comment(lib, "ws2_32.lib")
+#include "vmci/vmci_sockets.h"
 
-#define LISTEN_PORT 60400
+#pragma comment(lib, "ws2_32.lib")
 
 SOCKET sock = INVALID_SOCKET;
 PVIGEM_CLIENT client = nullptr;
@@ -39,7 +39,7 @@ void SendKey(WORD vkCode, BOOL keyDown) {
 
 int main() {
     CoInitialize(NULL);
-    printf("Starting receiver on UDP port %d...\n", LISTEN_PORT);
+    printf("Starting receiver on VMCI...\n");
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
@@ -47,17 +47,24 @@ int main() {
         return 1;
     }
 
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int af = VMCISock_GetAFValue();
+    if (af == -1) {
+        printf("VMCI not available\n");
+        WSACleanup();
+        return 1;
+    }
+
+    sock = socket(af, SOCK_DGRAM, 0);
     if (sock == INVALID_SOCKET) {
         printf("Failed to create socket\n");
         WSACleanup();
         return 1;
     }
 
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(LISTEN_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    sockaddr_vm addr = {};
+    addr.svm_family = af;
+    addr.svm_cid = VMCISock_GetLocalCID(); // local only
+    addr.svm_port = 0;
 
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         printf("Bind failed\n");
@@ -77,7 +84,7 @@ int main() {
 
     printf("Receiver ready.\n");
 
-    sockaddr_in sender = {};
+    sockaddr_vm sender = {};
     int senderLen = sizeof(sender);
     uint8_t buffer[sizeof(XINPUT_STATE) + 1];
 
