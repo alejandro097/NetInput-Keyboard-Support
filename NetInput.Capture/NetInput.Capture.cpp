@@ -12,6 +12,7 @@
 #include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ole32.lib")
 
 SOCKET sock = INVALID_SOCKET;
 sockaddr_in addr;
